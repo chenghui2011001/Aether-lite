@@ -212,10 +212,10 @@ class AntiBuzzLoss(nn.Module):
         f0_correlation = compute_f0_correlation(f0_pred_1d, f0_target_1d)
         losses['f0_shape'] = (1.0 - f0_correlation).clamp(min=0).mean()
 
-        # 5. Voicing二分类损失
+        # 5. Voicing二分类损失 (使用logits版本，混合精度安全)
         vuv_target = (feats_target[..., 19] > 0.5).float()  # 转为0/1标签
-        vuv_pred_prob = torch.sigmoid(feats_pred[..., 19])  # 转为概率
-        losses['vuv_bce'] = F.binary_cross_entropy(vuv_pred_prob, vuv_target)
+        vuv_pred_logits = feats_pred[..., 19]  # 直接使用logits
+        losses['vuv_bce'] = F.binary_cross_entropy_with_logits(vuv_pred_logits, vuv_target)
 
         # ===== 音频级监督 =====
 
