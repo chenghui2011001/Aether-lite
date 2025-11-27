@@ -31,6 +31,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torchaudio
 import numpy as np
 from tqdm import tqdm
+import wandb
 
 from utils.multi_stft_discriminator import create_adversarial_wave_loss
 from models.spi_lite_jscc import SPI_LiteSpeechJSCC
@@ -107,6 +108,13 @@ class SPITrainConfig:
     distributed: bool = False
     local_rank: int = 0
     world_size: int = 1
+
+    # Wandb配置
+    use_wandb: bool = True
+    wandb_project: str = "spi_jscc_training"
+    wandb_run_name: Optional[str] = None
+    wandb_watch_freq: int = 100  # 每多少步记录梯度
+    wandb_log_freq: int = 10     # 每多少步记录损失
 
 
 def save_checkpoint(
@@ -906,6 +914,281 @@ def unfreeze_fargan_vocoder(model, global_step: int, loss_scheduler: Progressive
     return False
 
 
+def init_wandb(cfg: SPITrainConfig, model: torch.nn.Module, is_main_process: bool) -> None:
+    """初始化wandb日志记录"""
+    if not cfg.use_wandb or not is_main_process:
+        return
+
+    # 生成运行名称
+    run_name = cfg.wandb_run_name or f"spi_stage{cfg.stage}_{'hash_' if cfg.enable_hash else ''}d{cfg.d_z}s{cfg.d_s}"
+
+    # 初始化wandb
+    wandb.init(
+        project=cfg.wandb_project,
+        name=run_name,
+        config={
+            "stage": cfg.stage,
+            "enable_hash": cfg.enable_hash,
+            "batch_size": cfg.batch_size,
+            "sequence_length": cfg.sequence_length,
+            "lr": cfg.lr,
+            "d_z": cfg.d_z,
+            "d_s": cfg.d_s,
+            "img_size": cfg.img_size,
+            "semantic_dim": cfg.semantic_dim,
+            "lambda_wave": cfg.lambda_wave,
+            "lambda_adv": cfg.lambda_adv,
+            "lambda_spi": cfg.lambda_spi,
+            "use_progressive": cfg.use_progressive,
+            "use_enhanced_losses": cfg.use_enhanced_losses,
+            "snr_min_db": cfg.snr_min_db,
+            "snr_max_db": cfg.snr_max_db,
+        }
+    )
+
+    # 监控关键模块的梯度
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # 监控编码器/解码器梯度
+    wandb.watch(
+        actual_model.spi_encoder,
+        log="gradients",
+        log_freq=cfg.wandb_watch_freq,
+        log_graph=False
+    )
+
+    wandb.watch(
+        actual_model.spi_decoder,
+        log="gradients",
+        log_freq=cfg.wandb_watch_freq,
+        log_graph=False
+    )
+
+    # 监控JSCC编解码器
+    if hasattr(actual_model, 'jscc_enc'):
+        wandb.watch(
+            actual_model.jscc_enc,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    if hasattr(actual_model, 'jscc_dec'):
+        wandb.watch(
+            actual_model.jscc_dec,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    # 监控语音->图像/语义模块
+    if hasattr(actual_model, 'speech_to_image'):
+        wandb.watch(
+            actual_model.speech_to_image,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    if hasattr(actual_model, 'semantic_pos_encoder'):
+        wandb.watch(
+            actual_model.semantic_pos_encoder,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    # 监控图像编解码器
+    if hasattr(actual_model, 'image_codec'):
+        wandb.watch(
+            actual_model.image_codec,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    # 监控 Hash bottleneck（如果启用）
+    if hasattr(actual_model, 'hash') and actual_model.hash is not None:
+        wandb.watch(
+            actual_model.hash,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    # 监控vocoder (如果未冻结)
+    if hasattr(actual_model, 'vocoder'):
+        wandb.watch(
+            actual_model.vocoder,
+            log="gradients",
+            log_freq=cfg.wandb_watch_freq,
+            log_graph=False
+        )
+
+    print(f"Wandb initialized: project='{cfg.wandb_project}', run='{run_name}'")
+
+
+def log_gradient_norms(model: torch.nn.Module, step: int, prefix: str = "") -> Dict[str, float]:
+    """记录模型关键组件的梯度范数"""
+    gradient_norms = {}
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # 记录关键模块的梯度范数
+    key_modules = {
+        f"{prefix}speech_to_image": getattr(actual_model, 'speech_to_image', None),
+        f"{prefix}semantic_pos_encoder": getattr(actual_model, 'semantic_pos_encoder', None),
+        f"{prefix}spi_encoder": getattr(actual_model, 'spi_encoder', None),
+        f"{prefix}spi_decoder": getattr(actual_model, 'spi_decoder', None),
+        f"{prefix}jscc_enc": getattr(actual_model, 'jscc_enc', None),
+        f"{prefix}jscc_dec": getattr(actual_model, 'jscc_dec', None),
+        f"{prefix}image_codec": getattr(actual_model, 'image_codec', None),
+        f"{prefix}vocoder": getattr(actual_model, 'vocoder', None),
+        f"{prefix}hash": getattr(actual_model, 'hash', None),
+    }
+
+    for name, module in key_modules.items():
+        if module is not None:
+            total_norm_sq = 0.0
+            grad_param_count = 0
+            requires_grad_count = 0
+
+            for param in module.parameters():
+                if param.requires_grad:
+                    requires_grad_count += 1
+                if param.grad is not None:
+                    # 只有实际参与反向传播的参数才计入统计
+                    param_norm = param.grad.data.norm(2)
+                    total_norm_sq += param_norm.item() ** 2
+                    grad_param_count += 1
+
+            # 无论是否有梯度，都记录参数数量和有梯度的参数数
+            gradient_norms[f"{name}_grad_params"] = float(requires_grad_count)
+            gradient_norms[f"{name}_grad_nonzero"] = float(grad_param_count)
+
+            if grad_param_count > 0:
+                # 仅在存在梯度时记录范数与分布统计
+                total_norm = total_norm_sq ** 0.5
+                gradient_norms[f"{name}_grad_norm"] = total_norm
+
+                all_grads = []
+                for param in module.parameters():
+                    if param.grad is not None:
+                        all_grads.extend(param.grad.data.view(-1).cpu().numpy())
+
+                if all_grads:
+                    all_grads = np.array(all_grads)
+                    gradient_norms[f"{name}_grad_mean"] = float(np.mean(all_grads))
+                    gradient_norms[f"{name}_grad_std"] = float(np.std(all_grads))
+                    gradient_norms[f"{name}_grad_max"] = float(np.max(np.abs(all_grads)))
+
+    return gradient_norms
+
+
+def log_to_wandb(
+    loss_dict: Dict,
+    gradient_norms: Dict,
+    spi_output: Dict,
+    cfg: SPITrainConfig,
+    step: int,
+    scheduler_weights: Dict,
+    is_main_process: bool
+) -> None:
+    """记录训练指标到wandb"""
+    if not cfg.use_wandb or not is_main_process:
+        return
+
+    # 基础损失指标
+    log_dict = {
+        "step": step,
+        "loss/total": loss_dict["total"].item(),
+        "loss/recon": loss_dict["recon"].item(),
+        "loss/adv": loss_dict["adv"].item(),
+        "loss/spi_total": loss_dict.get("spi_total", torch.zeros(1)).item(),
+    }
+
+    # 详细SPI损失组件
+    for key, value in loss_dict.items():
+        if key.startswith("spi_") and key != "spi_total":
+            log_dict[f"spi_loss/{key}"] = value.item()
+
+    # 增强损失组件
+    if "enhanced" in loss_dict and loss_dict["enhanced"].item() > 0:
+        log_dict["loss/enhanced"] = loss_dict["enhanced"].item()
+        for key, value in loss_dict.items():
+            if key.startswith("enhanced_"):
+                log_dict[f"enhanced_loss/{key}"] = value.item()
+
+    # Hash损失组件
+    hash_keys = ["bit_balance", "quantization", "entropy", "rate_kl", "bit_decorrelation", "hash_total"]
+    for key in hash_keys:
+        if key in loss_dict:
+            log_dict[f"hash_loss/{key}"] = loss_dict[key].item()
+
+    # 训练阶段信息
+    log_dict.update({
+        "training/stage_name": scheduler_weights["stage_name"],
+        "training/lambda_adv": scheduler_weights["current_lambda_adv"],
+        "training/lambda_spi": scheduler_weights["current_lambda_spi"],
+        "training/fargan_frozen": scheduler_weights.get("fargan_freeze", True),
+        "training/adv_scale": loss_dict.get("adv_scale", torch.zeros(1)).item(),
+    })
+
+    # JSCC相关指标
+    if "actual_snr" in spi_output:
+        log_dict["jscc/actual_snr_db"] = spi_output["actual_snr"].item()
+
+    if "s_multi" in spi_output and "s_multi_noisy" in spi_output:
+        s_clean = spi_output["s_multi"]
+        s_noisy = spi_output["s_multi_noisy"]
+        if s_clean is not None and s_noisy is not None:
+            # 计算符号功率和噪声功率
+            signal_power = torch.mean(s_clean.pow(2))
+            noise_power = torch.mean((s_noisy - s_clean).pow(2))
+            computed_snr = 10 * torch.log10(signal_power / (noise_power + 1e-8))
+            log_dict["jscc/computed_snr_db"] = computed_snr.item()
+
+    # 梯度范数
+    log_dict.update(gradient_norms)
+
+    # 特征重建质量
+    if "feats_hat" in spi_output and "feats" in spi_output:
+        feats_orig = spi_output["feats"]
+        feats_recon = spi_output["feats_hat"]
+        if feats_orig is not None and feats_recon is not None:
+            mse_per_dim = F.mse_loss(feats_recon, feats_orig, reduction='none').mean(dim=[0, 1])
+            for i, mse in enumerate(mse_per_dim):
+                log_dict[f"feature_quality/dim_{i:02d}_mse"] = mse.item()
+
+            # 总体特征质量指标
+            log_dict["feature_quality/total_mse"] = F.mse_loss(feats_recon, feats_orig).item()
+            log_dict["feature_quality/total_mae"] = F.l1_loss(feats_recon, feats_orig).item()
+
+    # 音频质量指标
+    if "audio_hat" in spi_output and "audio_real" in spi_output:
+        audio_real = spi_output["audio_real"]
+        audio_hat = spi_output["audio_hat"]
+        if audio_real is not None and audio_hat is not None:
+            # 确保维度匹配
+            min_len = min(audio_real.size(-1), audio_hat.size(-1))
+            audio_real_trim = audio_real[..., :min_len]
+            audio_hat_trim = audio_hat[..., :min_len]
+
+            # 计算SNR
+            signal_power = torch.mean(audio_real_trim.pow(2))
+            noise_power = torch.mean((audio_hat_trim - audio_real_trim).pow(2))
+            audio_snr = 10 * torch.log10(signal_power / (noise_power + 1e-8))
+            log_dict["audio_quality/snr_db"] = audio_snr.item()
+
+            # 计算相关系数
+            audio_real_flat = audio_real_trim.view(-1)
+            audio_hat_flat = audio_hat_trim.view(-1)
+            correlation = torch.corrcoef(torch.stack([audio_real_flat, audio_hat_flat]))[0, 1]
+            log_dict["audio_quality/correlation"] = correlation.item()
+
+    # 记录到wandb
+    wandb.log(log_dict, step=step)
+
+
 def setup_distributed(cfg: SPITrainConfig):
     """初始化分布式训练"""
     if cfg.distributed:
@@ -985,6 +1268,9 @@ def train_spi(cfg: SPITrainConfig):
                    find_unused_parameters=True)
         if is_main_process:
             print(f"🔗 Model wrapped with DistributedDataParallel")
+
+    # 初始化wandb
+    init_wandb(cfg, model, is_main_process)
 
     # 信道模拟器
     channel_sim = ChannelSimulator(sample_rate=16000, frame_hz=100)
@@ -1102,11 +1388,28 @@ def train_spi(cfg: SPITrainConfig):
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
+            # === 记录梯度信息到wandb ===
+            gradient_norms = {}
+            if cfg.use_wandb and is_main_process and global_step % cfg.wandb_watch_freq == 0:
+                gradient_norms = log_gradient_norms(model, global_step, prefix="")
+
             optimizer.step()
 
-            # === 更新进度条信息 ===
-            # 获取当前调度器信息
+            # === 获取当前调度器信息 ===
             scheduler_weights = loss_scheduler.get_weights(global_step)
+
+            # === 记录训练指标到wandb ===
+            if cfg.use_wandb and is_main_process and global_step % cfg.wandb_log_freq == 0:
+                log_to_wandb(
+                    loss_dict=loss_dict,
+                    gradient_norms=gradient_norms,
+                    spi_output=spi_output,
+                    cfg=cfg,
+                    step=global_step,
+                    scheduler_weights=scheduler_weights,
+                    is_main_process=is_main_process
+                )
 
             # 构建进度条postfix信息
             postfix_dict = {
@@ -1254,6 +1557,13 @@ def parse_args() -> SPITrainConfig:
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
     parser.add_argument("--world_size", type=int, default=1, help="World size for distributed training")
 
+    # Wandb配置
+    parser.add_argument("--use_wandb", action="store_true", default=True, help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="spi_jscc_training", help="Wandb project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name")
+    parser.add_argument("--wandb_watch_freq", type=int, default=100, help="Frequency for gradient logging")
+    parser.add_argument("--wandb_log_freq", type=int, default=10, help="Frequency for loss logging")
+
     args = parser.parse_args()
 
     return SPITrainConfig(
@@ -1297,6 +1607,11 @@ def parse_args() -> SPITrainConfig:
         distributed=args.distributed,
         local_rank=args.local_rank,
         world_size=args.world_size,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_watch_freq=args.wandb_watch_freq,
+        wandb_log_freq=args.wandb_log_freq,
     )
 
 
