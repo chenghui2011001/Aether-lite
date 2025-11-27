@@ -367,8 +367,11 @@ class SpeechToImageTransform(nn.Module):
             if group_name in group_outputs:
                 feature_dims = group_info['dims']
                 if len(feature_dims) > 0:
-                    # 直接赋值，不检查维度匹配（因为解码器输出维度就是group_dim）
-                    output_features[..., feature_dims] = group_outputs[group_name]
+                    # 确保数据类型匹配，处理混合精度训练中的类型不匹配问题
+                    group_output = group_outputs[group_name]
+                    if group_output.dtype != output_features.dtype:
+                        group_output = group_output.to(output_features.dtype)
+                    output_features[..., feature_dims] = group_output
 
         return output_features
 
@@ -456,9 +459,11 @@ class SpeechToImageTransform(nn.Module):
             for t in range(self.patch_time_len):
                 for d in range(16):
                     if d % 2 == 0:
-                        feature_pos[:, t, d] = torch.sin(torch.tensor(t / 10000.0 ** (d / 16.0)))
+                        val = torch.sin(torch.tensor(t / 10000.0 ** (d / 16.0), device=patch.device, dtype=patch.dtype))
+                        feature_pos[:, t, d] = val
                     else:
-                        feature_pos[:, t, d] = torch.cos(torch.tensor(t / 10000.0 ** ((d-1) / 16.0)))
+                        val = torch.cos(torch.tensor(t / 10000.0 ** ((d-1) / 16.0), device=patch.device, dtype=patch.dtype))
+                        feature_pos[:, t, d] = val
 
             # 语义条件增强
             semantic_cond = semantic_global.unsqueeze(1).expand(-1, self.patch_time_len, -1)
