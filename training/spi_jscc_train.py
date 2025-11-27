@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 import torchaudio
 import numpy as np
 from tqdm import tqdm
@@ -115,6 +116,13 @@ class SPITrainConfig:
     wandb_run_name: Optional[str] = None
     wandb_watch_freq: int = 100  # 每多少步记录梯度
     wandb_log_freq: int = 10     # 每多少步记录损失
+
+    # 混合精度训练配置
+    use_amp: bool = True         # 启用自动混合精度
+    amp_loss_scale: float = 128.0  # 初始损失缩放
+    amp_growth_factor: float = 2.0  # 缩放增长因子
+    amp_backoff_factor: float = 0.5  # 缩放衰减因子
+    amp_growth_interval: int = 2000  # 缩放更新间隔
 
 
 def save_checkpoint(
@@ -270,6 +278,7 @@ def forward_spi_progressive(
     stage: str,
     cfg: SPITrainConfig,
     device: torch.device,
+    use_amp: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
     SPI渐进式前向传播
@@ -302,56 +311,58 @@ def forward_spi_progressive(
     # 获取实际模型 (处理DDP包装)
     actual_model = model.module if hasattr(model, 'module') else model
 
-    if stage == "no_jscc":
-        # Stage 1: 直接编码-解码，不经过JSCC
-        encode_out = actual_model.spi_encode(feats, csi_vec)
-        decode_out = actual_model.spi_decode(encode_out['z_encoded_multi'], csi_vec, encode_out['semantic_vec'], encode_out.get('temporal_info'))
+    # 使用autocast包装计算密集的操作
+    with autocast(enabled=use_amp):
+        if stage == "no_jscc":
+            # Stage 1: 直接编码-解码，不经过JSCC
+            encode_out = actual_model.spi_encode(feats, csi_vec)
+            decode_out = actual_model.spi_decode(encode_out['z_encoded_multi'], csi_vec, encode_out['semantic_vec'], encode_out.get('temporal_info'))
 
-        output = {
-            **encode_out,
-            **decode_out,
-            'stage': stage,
-            'feats_hat': decode_out['feats_recovered'],
-        }
+            output = {
+                **encode_out,
+                **decode_out,
+                'stage': stage,
+                'feats_hat': decode_out['feats_recovered'],
+            }
 
-    elif stage == "no_channel":
-        # Stage 2: 多token JSCC但无信道噪声 - 修复：真正的多token处理
-        encode_out = actual_model.spi_encode(feats, csi_vec)
-        z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
-        z = encode_out['z_encoded']              # [B, d_z] 用于兼容
-        semantic_vec = encode_out['semantic_vec']
+        elif stage == "no_channel":
+            # Stage 2: 多token JSCC但无信道噪声 - 修复：真正的多token处理
+            encode_out = actual_model.spi_encode(feats, csi_vec)
+            z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
+            z = encode_out['z_encoded']              # [B, d_z] 用于兼容
+            semantic_vec = encode_out['semantic_vec']
 
-        # 多token JSCC 编码解码（不加噪声）
-        s_multi = actual_model.jscc_enc(z_multi, csi_vec)        # [B, N_patches, d_s]
-        z_hat_multi = actual_model.jscc_dec(s_multi, csi_vec)    # [B, N_patches, d_z]
+            # 多token JSCC 编码解码（不加噪声）
+            s_multi = actual_model.jscc_enc(z_multi, csi_vec)        # [B, N_patches, d_s]
+            z_hat_multi = actual_model.jscc_dec(s_multi, csi_vec)    # [B, N_patches, d_z]
 
-        # 单token作为summary（用于兼容/日志）
-        z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)
+            # 单token作为summary（用于兼容/日志）
+            z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)
 
-        decode_out = actual_model.spi_decode(
-            z_hat_multi,                         # 👈 使用完整多token
-            csi_vec,
-            semantic_vec,
-            encode_out.get('temporal_info'),
-            z_decoded_single=z_hat               # 单token作为备用
-        )
-        feat_hat = decode_out['feats_recovered']
+            decode_out = actual_model.spi_decode(
+                z_hat_multi,                         # 👈 使用完整多token
+                csi_vec,
+                semantic_vec,
+                encode_out.get('temporal_info'),
+                z_decoded_single=z_hat               # 单token作为备用
+            )
+            feat_hat = decode_out['feats_recovered']
 
-        output = {
-            **encode_out,
-            **decode_out,
-            'z': z,
-            'z_hat': z_hat,
-            'z_multi': z_multi,
-            'z_hat_multi': z_hat_multi,
-            's_multi': s_multi,
-            'stage': stage,
-            'feats_hat': feat_hat,
-        }
+            output = {
+                **encode_out,
+                **decode_out,
+                'z': z,
+                'z_hat': z_hat,
+                'z_multi': z_multi,
+                'z_hat_multi': z_hat_multi,
+                's_multi': s_multi,
+                'stage': stage,
+                'feats_hat': feat_hat,
+            }
 
-    elif stage == "stage3_hash":
-        # Stage 3: 多token JSCC + 轻量channel噪声，准备接入Hash（Step1策略：先稳定JSCC）
-        encode_out = actual_model.spi_encode(feats, csi_vec)
+        elif stage == "stage3_hash":
+            # Stage 3: 多token JSCC + 轻量channel噪声，准备接入Hash（Step1策略：先稳定JSCC）
+            encode_out = actual_model.spi_encode(feats, csi_vec)
         z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
         z = encode_out['z_encoded']              # [B, d_z] 用于兼容
         semantic_vec = encode_out['semantic_vec']
@@ -506,35 +517,40 @@ def forward_spi_progressive(
             ),
         }
 
-    # 通过vocoder生成音频
+    # 通过vocoder生成音频 (在autocast之外，避免兼容性问题)
     feat_hat = output['feats_hat']
     target_len = audio.size(-1)
 
-    try:
-        period, audio_hat = actual_model.vocoder(feat_hat, target_len=target_len)
-        audio_hat = audio_hat.squeeze(1) if audio_hat.dim() > 2 else audio_hat
+    # Vocoder推理通常需要float32精度以保证稳定性
+    with autocast(enabled=False):
+        # 确保特征为float32
+        feat_hat_f32 = feat_hat.float() if feat_hat.dtype != torch.float32 else feat_hat
 
-        # 长度对齐
-        if audio_hat.size(-1) != audio.size(-1):
-            min_len = min(audio_hat.size(-1), audio.size(-1))
-            audio_hat = audio_hat[..., :min_len]
-            audio = audio[..., :min_len]
+        try:
+            period, audio_hat = actual_model.vocoder(feat_hat_f32, target_len=target_len)
+            audio_hat = audio_hat.squeeze(1) if audio_hat.dim() > 2 else audio_hat
 
-        output.update({
-            'audio_hat': audio_hat,
-            'audio_real': audio,
-            'period': period,
-        })
+            # 长度对齐
+            if audio_hat.size(-1) != audio.size(-1):
+                min_len = min(audio_hat.size(-1), audio.size(-1))
+                audio_hat = audio_hat[..., :min_len]
+                audio = audio[..., :min_len]
 
-    except Exception as e:
-        print(f"Vocoder error: {e}")
-        # 创建dummy音频
-        audio_hat = torch.zeros_like(audio)
-        output.update({
-            'audio_hat': audio_hat,
-            'audio_real': audio,
-            'period': None,
-        })
+            output.update({
+                'audio_hat': audio_hat,
+                'audio_real': audio,
+                'period': period,
+            })
+
+        except Exception as e:
+            print(f"Vocoder error: {e}")
+            # 创建dummy音频
+            audio_hat = torch.zeros_like(audio)
+            output.update({
+                'audio_hat': audio_hat,
+                'audio_real': audio,
+                'period': None,
+            })
 
     return output
 
@@ -630,7 +646,8 @@ def compute_spi_training_loss(
     device: torch.device,
     model = None,  # 可能是 SPI_LiteSpeechJSCC 或 DistributedDataParallel
     global_step: int = 0,
-    loss_scheduler: Optional[ProgressiveLossScheduler] = None
+    loss_scheduler: Optional[ProgressiveLossScheduler] = None,
+    use_amp: bool = True
 ) -> Tuple[torch.Tensor, Dict]:
     """计算SPI训练损失（集成Anti-Buzz和渐进式调度）"""
 
@@ -943,6 +960,11 @@ def init_wandb(cfg: SPITrainConfig, model: torch.nn.Module, is_main_process: boo
             "use_enhanced_losses": cfg.use_enhanced_losses,
             "snr_min_db": cfg.snr_min_db,
             "snr_max_db": cfg.snr_max_db,
+            "use_amp": cfg.use_amp,
+            "amp_loss_scale": cfg.amp_loss_scale,
+            "amp_growth_factor": cfg.amp_growth_factor,
+            "amp_backoff_factor": cfg.amp_backoff_factor,
+            "amp_growth_interval": cfg.amp_growth_interval,
         }
     )
 
@@ -1091,7 +1113,8 @@ def log_to_wandb(
     cfg: SPITrainConfig,
     step: int,
     scheduler_weights: Dict,
-    is_main_process: bool
+    is_main_process: bool,
+    scaler: Optional[GradScaler] = None
 ) -> None:
     """记录训练指标到wandb"""
     if not cfg.use_wandb or not is_main_process:
@@ -1133,6 +1156,21 @@ def log_to_wandb(
         "training/fargan_frozen": bool(scheduler_weights.get("fargan_freeze", True)),
         "training/adv_scale": loss_dict.get("adv_scale", torch.zeros(1)).item(),
     })
+
+    # 混合精度训练信息
+    if scaler is not None and cfg.use_amp:
+        log_dict.update({
+            "amp/loss_scale": float(scaler.get_scale()),
+            "amp/growth_tracker": int(scaler._growth_tracker) if hasattr(scaler, '_growth_tracker') else 0,
+        })
+
+    # GPU内存使用信息 (如果可用)
+    if torch.cuda.is_available():
+        log_dict.update({
+            "system/gpu_memory_allocated_gb": torch.cuda.memory_allocated() / 1024**3,
+            "system/gpu_memory_reserved_gb": torch.cuda.memory_reserved() / 1024**3,
+            "system/gpu_utilization": torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else 0,
+        })
 
     # JSCC相关指标
     if "actual_snr" in spi_output:
@@ -1291,6 +1329,15 @@ def train_spi(cfg: SPITrainConfig):
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-5)
 
+    # 混合精度训练scaler
+    scaler = GradScaler(
+        init_scale=cfg.amp_loss_scale,
+        growth_factor=cfg.amp_growth_factor,
+        backoff_factor=cfg.amp_backoff_factor,
+        growth_interval=cfg.amp_growth_interval,
+        enabled=cfg.use_amp
+    )
+
     # 渐进式损失调度器 (Anti-Buzz核心组件)
     loss_scheduler = ProgressiveLossScheduler(
         stage1_steps=1000,    # Stage 1: 优先特征级监督
@@ -1363,6 +1410,7 @@ def train_spi(cfg: SPITrainConfig):
                 stage=stage,
                 cfg=cfg,
                 device=device,
+                use_amp=cfg.use_amp,
             )
 
             # 添加原始特征到输出 (用于损失计算)
@@ -1375,10 +1423,13 @@ def train_spi(cfg: SPITrainConfig):
             if adv_wave_loss is not None and global_step % 3 == 0:  # 每3步训练1次判别器
                 disc_optimizer.zero_grad()
                 try:
-                    disc_out = adv_wave_loss.discriminator_step(audio_real, audio_hat.detach())
-                    loss_d = disc_out["discriminator_loss"]
-                    loss_d.backward()
-                    disc_optimizer.step()
+                    with autocast(enabled=cfg.use_amp):
+                        disc_out = adv_wave_loss.discriminator_step(audio_real, audio_hat.detach())
+                        loss_d = disc_out["discriminator_loss"]
+
+                    scaler.scale(loss_d).backward()
+                    scaler.step(disc_optimizer)
+                    scaler.update()
                 except:
                     loss_d = torch.zeros(1, device=device)
             else:
@@ -1387,12 +1438,18 @@ def train_spi(cfg: SPITrainConfig):
             # === 生成器步骤 ===
             optimizer.zero_grad()
 
-            total_loss, loss_dict = compute_spi_training_loss(
-                spi_output, cfg, adv_wave_loss, enhanced_loss, device, model,
-                global_step=global_step, loss_scheduler=loss_scheduler
-            )
+            with autocast(enabled=cfg.use_amp):
+                total_loss, loss_dict = compute_spi_training_loss(
+                    spi_output, cfg, adv_wave_loss, enhanced_loss, device, model,
+                    global_step=global_step, loss_scheduler=loss_scheduler,
+                    use_amp=cfg.use_amp
+                )
 
-            total_loss.backward()
+            # 使用scaler进行反向传播
+            scaler.scale(total_loss).backward()
+
+            # 使用scaler进行梯度裁剪
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
             # === 记录梯度信息到wandb ===
@@ -1400,7 +1457,9 @@ def train_spi(cfg: SPITrainConfig):
             if cfg.use_wandb and is_main_process and global_step % cfg.wandb_watch_freq == 0:
                 gradient_norms = log_gradient_norms(model, global_step, prefix="")
 
-            optimizer.step()
+            # 使用scaler更新参数
+            scaler.step(optimizer)
+            scaler.update()
 
             # === 获取当前调度器信息 ===
             scheduler_weights = loss_scheduler.get_weights(global_step)
@@ -1414,7 +1473,8 @@ def train_spi(cfg: SPITrainConfig):
                     cfg=cfg,
                     step=global_step,
                     scheduler_weights=scheduler_weights,
-                    is_main_process=is_main_process
+                    is_main_process=is_main_process,
+                    scaler=scaler if cfg.use_amp else None
                 )
 
             # 构建进度条postfix信息
@@ -1570,6 +1630,13 @@ def parse_args() -> SPITrainConfig:
     parser.add_argument("--wandb_watch_freq", type=int, default=100, help="Frequency for gradient logging")
     parser.add_argument("--wandb_log_freq", type=int, default=10, help="Frequency for loss logging")
 
+    # 混合精度训练配置
+    parser.add_argument("--use_amp", action="store_true", default=True, help="Enable automatic mixed precision")
+    parser.add_argument("--amp_loss_scale", type=float, default=128.0, help="Initial loss scaling factor")
+    parser.add_argument("--amp_growth_factor", type=float, default=2.0, help="Loss scaling growth factor")
+    parser.add_argument("--amp_backoff_factor", type=float, default=0.5, help="Loss scaling backoff factor")
+    parser.add_argument("--amp_growth_interval", type=int, default=2000, help="Loss scaling update interval")
+
     args = parser.parse_args()
 
     return SPITrainConfig(
@@ -1618,6 +1685,11 @@ def parse_args() -> SPITrainConfig:
         wandb_run_name=args.wandb_run_name,
         wandb_watch_freq=args.wandb_watch_freq,
         wandb_log_freq=args.wandb_log_freq,
+        use_amp=args.use_amp,
+        amp_loss_scale=args.amp_loss_scale,
+        amp_growth_factor=args.amp_growth_factor,
+        amp_backoff_factor=args.amp_backoff_factor,
+        amp_growth_interval=args.amp_growth_interval,
     )
 
 
