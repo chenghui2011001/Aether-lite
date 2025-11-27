@@ -363,159 +363,159 @@ def forward_spi_progressive(
         elif stage == "stage3_hash":
             # Stage 3: 多token JSCC + 轻量channel噪声，准备接入Hash（Step1策略：先稳定JSCC）
             encode_out = actual_model.spi_encode(feats, csi_vec)
-        z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
-        z = encode_out['z_encoded']              # [B, d_z] 用于兼容
-        semantic_vec = encode_out['semantic_vec']
+            z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
+            z = encode_out['z_encoded']              # [B, d_z] 用于兼容
+            semantic_vec = encode_out['semantic_vec']
 
-        # 多token JSCC 编码
-        s_multi = actual_model.jscc_enc(z_multi, csi_vec)   # [B, N_patches, d_s]
+            # 多token JSCC 编码
+            s_multi = actual_model.jscc_enc(z_multi, csi_vec)   # [B, N_patches, d_s]
 
-        # 轻量信道噪声（比原来温和）
-        csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
-            B, z_multi.size(1), channel="fading", snr_min_db=cfg.snr_min_db, snr_max_db=cfg.snr_max_db
-        )
-        amp_t2 = amp_t2.to(device=s_multi.device, dtype=s_multi.dtype)
-        snr_db_t2 = snr_db_t2.to(device=s_multi.device, dtype=s_multi.dtype)
-        s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)  # [B, N_patches, d_s]
+            # 轻量信道噪声（比原来温和）
+            csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
+                B, z_multi.size(1), channel="fading", snr_min_db=cfg.snr_min_db, snr_max_db=cfg.snr_max_db
+            )
+            amp_t2 = amp_t2.to(device=s_multi.device, dtype=s_multi.dtype)
+            snr_db_t2 = snr_db_t2.to(device=s_multi.device, dtype=s_multi.dtype)
+            s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)  # [B, N_patches, d_s]
 
-        # 多token JSCC 解码
-        z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)       # [B, N_patches, d_z]
-        z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)  # [B, d_z]
+            # 多token JSCC 解码
+            z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)       # [B, N_patches, d_z]
+            z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)  # [B, d_z]
 
-        # Hash bottleneck (no bit noise) - 在JSCC处理后的多token上操作
-        hash_output = None  # 提前定义，避免未启用hash时NameError
+            # Hash bottleneck (no bit noise) - 在JSCC处理后的多token上操作
+            hash_output = None  # 提前定义，避免未启用hash时NameError
 
-        if hasattr(model, 'hash') and actual_model.hash is not None:
-            # 使用JSCC处理后的多token latents，而不是原始编码
-            if z_hat_multi is not None:
-                # 获取patch mask
-                temporal_info = encode_out.get('temporal_info')
+            if hasattr(model, 'hash') and actual_model.hash is not None:
+                # 使用JSCC处理后的多token latents，而不是原始编码
+                if z_hat_multi is not None:
+                    # 获取patch mask
+                    temporal_info = encode_out.get('temporal_info')
+                    patch_mask = temporal_info.get('patch_mask') if temporal_info else None
+                    hash_output = actual_model.hash(z_hat_multi, channel_params=None, mask=patch_mask)  # [B, N_patches, d_z]
+                    z_hash_multi = hash_output['reconstructed']  # [B, N_patches, d_z]
+                    hash_bits_clean = hash_output['hash_bits_clean']  # [B, N_patches, hash_bits]
+                    hash_logits = hash_output['hash_logits']  # [B, N_patches, hash_bits]
+                    # 为了兼容单token接口，使用第一个patch作为代表
+                    z_hash = z_hash_multi[:, 0, :]  # [B, d_z]
+                    hash_mask = hash_output.get('mask')
+                else:
+                    # 回退到单token处理
+                    hash_output = actual_model.hash(z_hat.unsqueeze(1), channel_params=None)  # [B, 1, d_z]
+                    z_hash = hash_output['reconstructed'].squeeze(1)  # [B, d_z]
+                    hash_bits_clean = hash_output['hash_bits_clean'].squeeze(1)  # [B, hash_bits]
+                    hash_logits = hash_output['hash_logits'].squeeze(1)  # [B, hash_bits]
+                    hash_mask = hash_output.get('mask')
+            else:
+                z_hash = z_hat
+                z_hash_multi = encode_out.get('z_encoded_multi', z_hat.unsqueeze(1))
+                hash_bits_clean = None
+                hash_logits = None
+                hash_mask = None
+
+            # SPI 解码 - 修复：使用完整多token而不是只用第一个
+            decode_out = actual_model.spi_decode(
+                z_hash_multi,                    # 👈 使用完整多token作为主干
+                csi_vec,
+                semantic_vec,
+                encode_out.get('temporal_info'),
+                z_decoded_single=z_hash          # 单token作为备用，不是主干
+            )
+            feat_hat = decode_out['feats_recovered']
+
+            output = {
+                **encode_out,
+                **decode_out,
+                'z': z,
+                'z_hat': z_hat,
+                'z_multi': z_multi,
+                'z_hat_multi': z_hat_multi,
+                'z_hash': z_hash,
+                'z_hash_multi': z_hash_multi,
+                's_multi': s_multi,
+                's_multi_noisy': s_multi_noisy,
+                'hash_bits_clean': hash_bits_clean,
+                'hash_logits': hash_logits,
+                'hash_mask': hash_mask,
+                'stage': stage,
+                'feats_hat': feat_hat,
+                'actual_snr': 10 * torch.log10(
+                    torch.mean(s_multi.pow(2)) / (torch.mean((s_multi_noisy - s_multi).pow(2)) + 1e-8)
+                ),
+            }
+
+        elif stage == "stage4_hash_noise":
+            # Stage 4: 多token JSCC + 信道噪声 + Hash + bit噪声 (完全串联)
+            encode_out = actual_model.spi_encode(feats, csi_vec)
+            z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
+            semantic_vec = encode_out['semantic_vec']
+            temporal_info = encode_out.get('temporal_info')
+
+            # 1) 多token JSCC 编码
+            s_multi = actual_model.jscc_enc(z_multi, csi_vec)    # [B, N_patches, d_s]
+
+            # 2) 多token 信道噪声
+            csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
+                B, z_multi.size(1),
+                channel="fading",
+                snr_min_db=cfg.snr_min_db,
+                snr_max_db=cfg.snr_max_db
+            )
+            amp_t2 = amp_t2.to(device=s_multi.device, dtype=s_multi.dtype)
+            snr_db_t2 = snr_db_t2.to(device=s_multi.device, dtype=s_multi.dtype)
+            s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)
+
+            # 3) 多token JSCC 解码
+            z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)   # [B, N_patches, d_z]
+
+            # 4) Hash bottleneck + bit 噪声（在 JSCC 输出上）
+            hash_output = None  # 提前定义，避免未启用hash时NameError
+
+            if hasattr(model, 'hash') and actual_model.hash is not None:
+                base_ber = 0.01
+                max_ber = 0.15
+                warm_frac = 0.3  # 简单先写死
+                scheduled_ber = base_ber + warm_frac * (max_ber - base_ber)
+                channel_params = {'ber': scheduled_ber}
+
                 patch_mask = temporal_info.get('patch_mask') if temporal_info else None
-                hash_output = actual_model.hash(z_hat_multi, channel_params=None, mask=patch_mask)  # [B, N_patches, d_z]
-                z_hash_multi = hash_output['reconstructed']  # [B, N_patches, d_z]
-                hash_bits_clean = hash_output['hash_bits_clean']  # [B, N_patches, hash_bits]
-                hash_logits = hash_output['hash_logits']  # [B, N_patches, hash_bits]
-                # 为了兼容单token接口，使用第一个patch作为代表
-                z_hash = z_hash_multi[:, 0, :]  # [B, d_z]
+                hash_output = actual_model.hash(z_hat_multi, channel_params=channel_params, mask=patch_mask)
+                z_hash_multi = hash_output['reconstructed']
+                hash_bits_clean = hash_output['hash_bits_clean']
+                hash_bits_noisy = hash_output['hash_bits_noisy']
+                hash_logits = hash_output['hash_logits']
                 hash_mask = hash_output.get('mask')
             else:
-                # 回退到单token处理
-                hash_output = actual_model.hash(z_hat.unsqueeze(1), channel_params=None)  # [B, 1, d_z]
-                z_hash = hash_output['reconstructed'].squeeze(1)  # [B, d_z]
-                hash_bits_clean = hash_output['hash_bits_clean'].squeeze(1)  # [B, hash_bits]
-                hash_logits = hash_output['hash_logits'].squeeze(1)  # [B, hash_bits]
-                hash_mask = hash_output.get('mask')
-        else:
-            z_hash = z_hat
-            z_hash_multi = encode_out.get('z_encoded_multi', z_hat.unsqueeze(1))
-            hash_bits_clean = None
-            hash_logits = None
-            hash_mask = None
+                z_hash_multi = z_hat_multi
+                hash_bits_clean = hash_bits_noisy = hash_logits = None
+                hash_mask = None
 
-        # SPI 解码 - 修复：使用完整多token而不是只用第一个
-        decode_out = actual_model.spi_decode(
-            z_hash_multi,                    # 👈 使用完整多token作为主干
-            csi_vec,
-            semantic_vec,
-            encode_out.get('temporal_info'),
-            z_decoded_single=z_hash          # 单token作为备用，不是主干
-        )
-        feat_hat = decode_out['feats_recovered']
+            # 5) SPI 解码（多token主干）
+            decode_out = actual_model.spi_decode(
+                z_hash_multi,
+                csi_vec,
+                semantic_vec,
+                temporal_info
+            )
+            feat_hat = decode_out['feats_recovered']
 
-        output = {
-            **encode_out,
-            **decode_out,
-            'z': z,
-            'z_hat': z_hat,
-            'z_multi': z_multi,
-            'z_hat_multi': z_hat_multi,
-            'z_hash': z_hash,
-            'z_hash_multi': z_hash_multi,
-            's_multi': s_multi,
-            's_multi_noisy': s_multi_noisy,
-            'hash_bits_clean': hash_bits_clean,
-            'hash_logits': hash_logits,
-            'hash_mask': hash_mask,
-            'stage': stage,
-            'feats_hat': feat_hat,
-            'actual_snr': 10 * torch.log10(
-                torch.mean(s_multi.pow(2)) / (torch.mean((s_multi_noisy - s_multi).pow(2)) + 1e-8)
-            ),
-        }
-
-    elif stage == "stage4_hash_noise":
-        # Stage 4: 多token JSCC + 信道噪声 + Hash + bit噪声 (完全串联)
-        encode_out = actual_model.spi_encode(feats, csi_vec)
-        z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
-        semantic_vec = encode_out['semantic_vec']
-        temporal_info = encode_out.get('temporal_info')
-
-        # 1) 多token JSCC 编码
-        s_multi = actual_model.jscc_enc(z_multi, csi_vec)    # [B, N_patches, d_s]
-
-        # 2) 多token 信道噪声
-        csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
-            B, z_multi.size(1),
-            channel="fading",
-            snr_min_db=cfg.snr_min_db,
-            snr_max_db=cfg.snr_max_db
-        )
-        amp_t2 = amp_t2.to(device=s_multi.device, dtype=s_multi.dtype)
-        snr_db_t2 = snr_db_t2.to(device=s_multi.device, dtype=s_multi.dtype)
-        s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)
-
-        # 3) 多token JSCC 解码
-        z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)   # [B, N_patches, d_z]
-
-        # 4) Hash bottleneck + bit 噪声（在 JSCC 输出上）
-        hash_output = None  # 提前定义，避免未启用hash时NameError
-
-        if hasattr(model, 'hash') and actual_model.hash is not None:
-            base_ber = 0.01
-            max_ber = 0.15
-            warm_frac = 0.3  # 简单先写死
-            scheduled_ber = base_ber + warm_frac * (max_ber - base_ber)
-            channel_params = {'ber': scheduled_ber}
-
-            patch_mask = temporal_info.get('patch_mask') if temporal_info else None
-            hash_output = actual_model.hash(z_hat_multi, channel_params=channel_params, mask=patch_mask)
-            z_hash_multi = hash_output['reconstructed']
-            hash_bits_clean = hash_output['hash_bits_clean']
-            hash_bits_noisy = hash_output['hash_bits_noisy']
-            hash_logits = hash_output['hash_logits']
-            hash_mask = hash_output.get('mask')
-        else:
-            z_hash_multi = z_hat_multi
-            hash_bits_clean = hash_bits_noisy = hash_logits = None
-            hash_mask = None
-
-        # 5) SPI 解码（多token主干）
-        decode_out = actual_model.spi_decode(
-            z_hash_multi,
-            csi_vec,
-            semantic_vec,
-            temporal_info
-        )
-        feat_hat = decode_out['feats_recovered']
-
-        output = {
-            **encode_out,
-            **decode_out,
-            'z_multi': z_multi,
-            'z_hat_multi': z_hat_multi,
-            'z_hash_multi': z_hash_multi,
-            's_multi': s_multi,
-            's_multi_noisy': s_multi_noisy,
-            'hash_bits_clean': hash_bits_clean,
-            'hash_bits_noisy': hash_bits_noisy,
-            'hash_logits': hash_logits,
-            'hash_mask': hash_mask,
-            'stage': stage,
-            'feats_hat': feat_hat,
-            'actual_snr': 10 * torch.log10(
-                torch.mean(s_multi.pow(2)) / (torch.mean((s_multi_noisy - s_multi).pow(2)) + 1e-8)
-            ),
-        }
+            output = {
+                **encode_out,
+                **decode_out,
+                'z_multi': z_multi,
+                'z_hat_multi': z_hat_multi,
+                'z_hash_multi': z_hash_multi,
+                's_multi': s_multi,
+                's_multi_noisy': s_multi_noisy,
+                'hash_bits_clean': hash_bits_clean,
+                'hash_bits_noisy': hash_bits_noisy,
+                'hash_logits': hash_logits,
+                'hash_mask': hash_mask,
+                'stage': stage,
+                'feats_hat': feat_hat,
+                'actual_snr': 10 * torch.log10(
+                    torch.mean(s_multi.pow(2)) / (torch.mean((s_multi_noisy - s_multi).pow(2)) + 1e-8)
+                ),
+            }
 
     # 通过vocoder生成音频 (在autocast之外，避免兼容性问题)
     feat_hat = output['feats_hat']
