@@ -255,7 +255,7 @@ def determine_training_stage(global_step: int, cfg: SPITrainConfig) -> str:
 
 
 def forward_spi_progressive(
-    model: SPI_LiteSpeechJSCC,
+    model,  # 可能是 SPI_LiteSpeechJSCC 或 DistributedDataParallel
     feats: torch.Tensor,
     audio: torch.Tensor,
     channel_sim: ChannelSimulator,
@@ -291,10 +291,13 @@ def forward_spi_progressive(
         csi_dict["los_ratio"],
     ], dim=-1).to(device=device, dtype=feats.dtype)
 
+    # 获取实际模型 (处理DDP包装)
+    actual_model = model.module if hasattr(model, 'module') else model
+
     if stage == "no_jscc":
         # Stage 1: 直接编码-解码，不经过JSCC
-        encode_out = model.spi_encode(feats, csi_vec)
-        decode_out = model.spi_decode(encode_out['z_encoded_multi'], csi_vec, encode_out['semantic_vec'], encode_out.get('temporal_info'))
+        encode_out = actual_model.spi_encode(feats, csi_vec)
+        decode_out = actual_model.spi_decode(encode_out['z_encoded_multi'], csi_vec, encode_out['semantic_vec'], encode_out.get('temporal_info'))
 
         output = {
             **encode_out,
@@ -305,19 +308,19 @@ def forward_spi_progressive(
 
     elif stage == "no_channel":
         # Stage 2: 多token JSCC但无信道噪声 - 修复：真正的多token处理
-        encode_out = model.spi_encode(feats, csi_vec)
+        encode_out = actual_model.spi_encode(feats, csi_vec)
         z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
         z = encode_out['z_encoded']              # [B, d_z] 用于兼容
         semantic_vec = encode_out['semantic_vec']
 
         # 多token JSCC 编码解码（不加噪声）
-        s_multi = model.jscc_enc(z_multi, csi_vec)        # [B, N_patches, d_s]
-        z_hat_multi = model.jscc_dec(s_multi, csi_vec)    # [B, N_patches, d_z]
+        s_multi = actual_model.jscc_enc(z_multi, csi_vec)        # [B, N_patches, d_s]
+        z_hat_multi = actual_model.jscc_dec(s_multi, csi_vec)    # [B, N_patches, d_z]
 
         # 单token作为summary（用于兼容/日志）
         z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)
 
-        decode_out = model.spi_decode(
+        decode_out = actual_model.spi_decode(
             z_hat_multi,                         # 👈 使用完整多token
             csi_vec,
             semantic_vec,
@@ -340,13 +343,13 @@ def forward_spi_progressive(
 
     elif stage == "stage3_hash":
         # Stage 3: 多token JSCC + 轻量channel噪声，准备接入Hash（Step1策略：先稳定JSCC）
-        encode_out = model.spi_encode(feats, csi_vec)
+        encode_out = actual_model.spi_encode(feats, csi_vec)
         z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
         z = encode_out['z_encoded']              # [B, d_z] 用于兼容
         semantic_vec = encode_out['semantic_vec']
 
         # 多token JSCC 编码
-        s_multi = model.jscc_enc(z_multi, csi_vec)   # [B, N_patches, d_s]
+        s_multi = actual_model.jscc_enc(z_multi, csi_vec)   # [B, N_patches, d_s]
 
         # 轻量信道噪声（比原来温和）
         csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
@@ -357,19 +360,19 @@ def forward_spi_progressive(
         s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)  # [B, N_patches, d_s]
 
         # 多token JSCC 解码
-        z_hat_multi = model.jscc_dec(s_multi_noisy, csi_vec)       # [B, N_patches, d_z]
+        z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)       # [B, N_patches, d_z]
         z_hat = z_hat_multi.mean(dim=1) if z_hat_multi.size(1) > 1 else z_hat_multi.squeeze(1)  # [B, d_z]
 
         # Hash bottleneck (no bit noise) - 在JSCC处理后的多token上操作
         hash_output = None  # 提前定义，避免未启用hash时NameError
 
-        if hasattr(model, 'hash') and model.hash is not None:
+        if hasattr(model, 'hash') and actual_model.hash is not None:
             # 使用JSCC处理后的多token latents，而不是原始编码
             if z_hat_multi is not None:
                 # 获取patch mask
                 temporal_info = encode_out.get('temporal_info')
                 patch_mask = temporal_info.get('patch_mask') if temporal_info else None
-                hash_output = model.hash(z_hat_multi, channel_params=None, mask=patch_mask)  # [B, N_patches, d_z]
+                hash_output = actual_model.hash(z_hat_multi, channel_params=None, mask=patch_mask)  # [B, N_patches, d_z]
                 z_hash_multi = hash_output['reconstructed']  # [B, N_patches, d_z]
                 hash_bits_clean = hash_output['hash_bits_clean']  # [B, N_patches, hash_bits]
                 hash_logits = hash_output['hash_logits']  # [B, N_patches, hash_bits]
@@ -378,7 +381,7 @@ def forward_spi_progressive(
                 hash_mask = hash_output.get('mask')
             else:
                 # 回退到单token处理
-                hash_output = model.hash(z_hat.unsqueeze(1), channel_params=None)  # [B, 1, d_z]
+                hash_output = actual_model.hash(z_hat.unsqueeze(1), channel_params=None)  # [B, 1, d_z]
                 z_hash = hash_output['reconstructed'].squeeze(1)  # [B, d_z]
                 hash_bits_clean = hash_output['hash_bits_clean'].squeeze(1)  # [B, hash_bits]
                 hash_logits = hash_output['hash_logits'].squeeze(1)  # [B, hash_bits]
@@ -391,7 +394,7 @@ def forward_spi_progressive(
             hash_mask = None
 
         # SPI 解码 - 修复：使用完整多token而不是只用第一个
-        decode_out = model.spi_decode(
+        decode_out = actual_model.spi_decode(
             z_hash_multi,                    # 👈 使用完整多token作为主干
             csi_vec,
             semantic_vec,
@@ -423,13 +426,13 @@ def forward_spi_progressive(
 
     elif stage == "stage4_hash_noise":
         # Stage 4: 多token JSCC + 信道噪声 + Hash + bit噪声 (完全串联)
-        encode_out = model.spi_encode(feats, csi_vec)
+        encode_out = actual_model.spi_encode(feats, csi_vec)
         z_multi = encode_out['z_encoded_multi']  # [B, N_patches, d_z]
         semantic_vec = encode_out['semantic_vec']
         temporal_info = encode_out.get('temporal_info')
 
         # 1) 多token JSCC 编码
-        s_multi = model.jscc_enc(z_multi, csi_vec)    # [B, N_patches, d_s]
+        s_multi = actual_model.jscc_enc(z_multi, csi_vec)    # [B, N_patches, d_s]
 
         # 2) 多token 信道噪声
         csi_dict2, amp_t2, snr_db_t2 = channel_sim.sample_csi(
@@ -443,12 +446,12 @@ def forward_spi_progressive(
         s_multi_noisy = channel_sim.apply(s_multi, amp_t2, snr_db_t2)
 
         # 3) 多token JSCC 解码
-        z_hat_multi = model.jscc_dec(s_multi_noisy, csi_vec)   # [B, N_patches, d_z]
+        z_hat_multi = actual_model.jscc_dec(s_multi_noisy, csi_vec)   # [B, N_patches, d_z]
 
         # 4) Hash bottleneck + bit 噪声（在 JSCC 输出上）
         hash_output = None  # 提前定义，避免未启用hash时NameError
 
-        if hasattr(model, 'hash') and model.hash is not None:
+        if hasattr(model, 'hash') and actual_model.hash is not None:
             base_ber = 0.01
             max_ber = 0.15
             warm_frac = 0.3  # 简单先写死
@@ -456,7 +459,7 @@ def forward_spi_progressive(
             channel_params = {'ber': scheduled_ber}
 
             patch_mask = temporal_info.get('patch_mask') if temporal_info else None
-            hash_output = model.hash(z_hat_multi, channel_params=channel_params, mask=patch_mask)
+            hash_output = actual_model.hash(z_hat_multi, channel_params=channel_params, mask=patch_mask)
             z_hash_multi = hash_output['reconstructed']
             hash_bits_clean = hash_output['hash_bits_clean']
             hash_bits_noisy = hash_output['hash_bits_noisy']
@@ -468,7 +471,7 @@ def forward_spi_progressive(
             hash_mask = None
 
         # 5) SPI 解码（多token主干）
-        decode_out = model.spi_decode(
+        decode_out = actual_model.spi_decode(
             z_hash_multi,
             csi_vec,
             semantic_vec,
@@ -500,7 +503,7 @@ def forward_spi_progressive(
     target_len = audio.size(-1)
 
     try:
-        period, audio_hat = model.vocoder(feat_hat, target_len=target_len)
+        period, audio_hat = actual_model.vocoder(feat_hat, target_len=target_len)
         audio_hat = audio_hat.squeeze(1) if audio_hat.dim() > 2 else audio_hat
 
         # 长度对齐
@@ -617,7 +620,7 @@ def compute_spi_training_loss(
     adv_wave_loss,
     enhanced_loss,
     device: torch.device,
-    model: Optional['SPI_LiteSpeechJSCC'] = None,
+    model = None,  # 可能是 SPI_LiteSpeechJSCC 或 DistributedDataParallel
     global_step: int = 0,
     loss_scheduler: Optional[ProgressiveLossScheduler] = None
 ) -> Tuple[torch.Tensor, Dict]:
@@ -627,6 +630,9 @@ def compute_spi_training_loss(
     audio_real = output['audio_real']
     feats_hat = output['feats_hat']
     feats = output.get('feats', None)
+
+    # 获取实际模型 (处理DDP包装)
+    actual_model = model.module if hasattr(model, 'module') else model
 
     losses = {}
 
@@ -690,7 +696,7 @@ def compute_spi_training_loss(
     # 4. SPI专用损失（集成Anti-Buzz功能）
     if feats is not None and model is not None:
         # 使用模型的集成Anti-Buzz损失计算
-        spi_loss_total, spi_losses = model.compute_spi_loss(
+        spi_loss_total, spi_losses = actual_model.compute_spi_loss(
             output, feats, audio_hat, audio_real
         )
         losses['spi_total'] = spi_loss_total
@@ -713,9 +719,9 @@ def compute_spi_training_loss(
     hash_bits_clean = output.get('hash_bits_clean')
     hash_mask = output.get('hash_mask')
 
-    if hash_logits is not None and hash_bits_clean is not None and hasattr(model, 'hash') and model.hash is not None:
+    if hash_logits is not None and hash_bits_clean is not None and hasattr(model, 'hash') and actual_model.hash is not None:
         # 使用HashBottleneck的新API计算正则化损失，支持mask
-        hash_reg_losses = model.hash.compute_hash_regularization(
+        hash_reg_losses = actual_model.hash.compute_hash_regularization(
             hash_logits, hash_bits_clean, mask=hash_mask
         )
 
@@ -804,9 +810,12 @@ def build_spi_model(cfg: SPITrainConfig) -> SPI_LiteSpeechJSCC:
     return model
 
 
-def init_fargan_from_checkpoint(model: SPI_LiteSpeechJSCC, cfg: SPITrainConfig, device: torch.device) -> None:
+def init_fargan_from_checkpoint(model, cfg: SPITrainConfig, device: torch.device) -> None:
     """加载并冻结FARGAN声码器权重（只修改本脚本内的使用方式）"""
-    if not hasattr(model, "vocoder"):
+    # 获取实际模型 (处理DDP包装)
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    if not hasattr(actual_model, "vocoder"):
         print("Model has no vocoder; skip FARGAN init.")
         return
 
@@ -839,7 +848,7 @@ def init_fargan_from_checkpoint(model: SPI_LiteSpeechJSCC, cfg: SPITrainConfig, 
     else:
         dec_sd = ckpt
 
-    voc_sd = model.vocoder.state_dict()
+    voc_sd = actual_model.vocoder.state_dict()
     to_load = {}
 
     # 映射checkpoint参数名到模型参数名
@@ -858,21 +867,24 @@ def init_fargan_from_checkpoint(model: SPI_LiteSpeechJSCC, cfg: SPITrainConfig, 
         print("No matching FARGAN parameters found in checkpoint; vocoder left unchanged.")
     else:
         voc_sd.update(to_load)
-        model.vocoder.load_state_dict(voc_sd, strict=False)
+        actual_model.vocoder.load_state_dict(voc_sd, strict=False)
         print(f"Successfully loaded {len(to_load)} FARGAN parameters into vocoder!")
 
     # 冻结FARGAN声码器参数
     frozen_count = 0
-    for _, param in model.vocoder.named_parameters():
+    for _, param in actual_model.vocoder.named_parameters():
         if param.requires_grad:
             param.requires_grad = False
             frozen_count += 1
     print(f"FARGAN vocoder parameters frozen (count={frozen_count}).")
 
 
-def unfreeze_fargan_vocoder(model: SPI_LiteSpeechJSCC, global_step: int, loss_scheduler: ProgressiveLossScheduler) -> bool:
+def unfreeze_fargan_vocoder(model, global_step: int, loss_scheduler: ProgressiveLossScheduler) -> bool:
     """根据渐进式调度器解冻FARGAN声码器 (Stage 4: 5000+ steps)"""
-    if not hasattr(model, "vocoder") or loss_scheduler is None:
+    # 获取实际模型 (处理DDP包装)
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    if not hasattr(actual_model, "vocoder") or loss_scheduler is None:
         return False
 
     # 检查是否进入Stage 4 (fargan_freeze = False)
@@ -882,7 +894,7 @@ def unfreeze_fargan_vocoder(model: SPI_LiteSpeechJSCC, global_step: int, loss_sc
     # 仅在第一次进入Stage 4时解冻
     if should_unfreeze and global_step == loss_scheduler.stage3_steps:
         unfrozen_count = 0
-        for _, param in model.vocoder.named_parameters():
+        for _, param in actual_model.vocoder.named_parameters():
             if not param.requires_grad:
                 param.requires_grad = True
                 unfrozen_count += 1
