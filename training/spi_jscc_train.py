@@ -1180,9 +1180,9 @@ def log_to_wandb(
             audio_snr = 10 * torch.log10(signal_power / (noise_power + 1e-8))
             log_dict["audio_quality/snr_db"] = audio_snr.item()
 
-            # 计算相关系数
-            audio_real_flat = audio_real_trim.view(-1)
-            audio_hat_flat = audio_hat_trim.view(-1)
+            # 计算相关系数（使用 reshape 处理可能的非连续张量）
+            audio_real_flat = audio_real_trim.reshape(-1)
+            audio_hat_flat = audio_hat_trim.reshape(-1)
             correlation = torch.corrcoef(torch.stack([audio_real_flat, audio_hat_flat]))[0, 1]
             log_dict["audio_quality/correlation"] = correlation.item()
 
