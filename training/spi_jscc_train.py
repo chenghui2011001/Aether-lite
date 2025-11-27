@@ -1124,12 +1124,13 @@ def log_to_wandb(
         if key in loss_dict:
             log_dict[f"hash_loss/{key}"] = loss_dict[key].item()
 
-    # 训练阶段信息
+    # 训练阶段信息（使用调度器提供的当前权重）
     log_dict.update({
-        "training/stage_name": scheduler_weights["stage_name"],
-        "training/lambda_adv": scheduler_weights["current_lambda_adv"],
-        "training/lambda_spi": scheduler_weights["current_lambda_spi"],
-        "training/fargan_frozen": scheduler_weights.get("fargan_freeze", True),
+        "training/stage_name": scheduler_weights.get("stage_name", "unknown"),
+        # ProgressiveLossScheduler.get_weights 返回的键为 'lambda_adv' / 'lambda_spi'
+        "training/lambda_adv": float(scheduler_weights.get("lambda_adv", 0.0)),
+        "training/lambda_spi": float(scheduler_weights.get("lambda_spi", 0.0)),
+        "training/fargan_frozen": bool(scheduler_weights.get("fargan_freeze", True)),
         "training/adv_scale": loss_dict.get("adv_scale", torch.zeros(1)).item(),
     })
 
