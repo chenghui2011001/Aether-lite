@@ -9,7 +9,9 @@ import os
 import json
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from typing import Tuple, Optional, Dict, List
 from pathlib import Path
 from .feature_spec import get_default_feature_spec, FeatureSpec
@@ -442,6 +444,7 @@ def create_aether_data_loader(
     pin_memory: Optional[bool] = None,
     persistent_workers: Optional[bool] = None,
     prefetch_factor: Optional[int] = None,
+    distributed: bool = False,
 ) -> Tuple[DataLoader, AETHERRealDataset]:
     """
     创建AETHER数据加载器
@@ -465,7 +468,7 @@ def create_aether_data_loader(
         dataloader, dataset
     """
 
-    print(f"Creating AETHER data loader (test_mode={test_mode})...")
+    print(f"Creating AETHER data loader (test_mode={test_mode}, distributed={distributed})...")
 
     # 步幅策略：可配置或智能自适应
     if stride_frames is not None:
@@ -529,15 +532,25 @@ def create_aether_data_loader(
         optimized_workers = 4
         print(f"  ⚡ Auto-optimized workers: {num_workers} → {optimized_workers} (reduce CPU-GPU contention)")
 
+    # 分布式采样器：在 DDP 下确保每个 rank 看到不同子集
+    sampler = None
+    if distributed and dist.is_available() and dist.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=not test_mode)
+        print(
+            f"Using DistributedSampler: world_size={dist.get_world_size()}, "
+            f"rank={dist.get_rank()}, shuffle={not test_mode}"
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None and not test_mode),
+        sampler=sampler,
         num_workers=optimized_workers,
         pin_memory=dl_pin_memory,
         drop_last=True,
         persistent_workers=dl_persistent_workers,
-        prefetch_factor=dl_prefetch_factor
+        prefetch_factor=dl_prefetch_factor,
     )
 
     print(f"Data loader created:")

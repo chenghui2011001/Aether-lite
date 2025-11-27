@@ -1243,14 +1243,14 @@ def train_spi(cfg: SPITrainConfig):
         dataloader, dataset = create_aether_data_loader(
             data_dir=cfg.data_root,
             sequence_length=cfg.sequence_length,
-            batch_size=cfg.batch_size // cfg.world_size,  # 调整batch_size
+            batch_size=cfg.batch_size // cfg.world_size,  # 每卡 batch
             features_file=features_file,
             audio_file=audio_file,
             max_samples=None,
             num_workers=8 // cfg.world_size,  # 调整worker数量
             energy_selection=True,
             feature_spec_type="fargan",  # 使用FARGAN兼容的36维特征规范
-            distributed=cfg.distributed  # 传递分布式标志
+            distributed=cfg.distributed,
         )
 
     # 构建模型
@@ -1323,6 +1323,11 @@ def train_spi(cfg: SPITrainConfig):
 
     # 训练循环
     for epoch in range(start_epoch, cfg.num_epochs):
+        # 确保 DistributedSampler 在每个 epoch 使用不同随机种子
+        if cfg.distributed and hasattr(dataloader, 'sampler'):
+            from torch.utils.data.distributed import DistributedSampler
+            if isinstance(dataloader.sampler, DistributedSampler):
+                dataloader.sampler.set_epoch(epoch)
         model.train()
 
         # 创建带进度条的dataloader
